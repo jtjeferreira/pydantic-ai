@@ -2616,3 +2616,42 @@ async def test_instrumented_model_request_error(capfire: CaptureLogfire):
     # finish() was never called, so response-specific attributes are absent
     assert 'gen_ai.response.id' not in spans[0]['attributes']
     assert 'gen_ai.usage.input_tokens' not in spans[0]['attributes']
+
+
+def test_otel_message_parts_should_normalise_string_tool_args_to_dict():
+    """REPRODUCER (no fix applied): the OTel message serialiser passes
+    `ToolCallPart.args` through verbatim. When `args` is a string (which
+    happens on every streaming provider path — Bedrock, OpenAI, Gemini
+    accumulate JSON deltas into a string via parts_manager) the OTel
+    attribute ends up with `'arguments'` as a string instead of the
+    object that consumers (Langfuse, Logfire) expect.
+
+    This test should FAIL on main and PASS once the serialiser
+    normalises via `args_as_dict()`.
+    """
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+    response = ModelResponse(
+        parts=[
+            # Streaming-path shape (eg. Bedrock contentBlockDelta.toolUse.input
+            # is a JSON string accumulated by parts_manager).
+            ToolCallPart('weather', '{"city": "London"}', 'tc_string'),
+            # Non-streaming-path shape (eg. Bedrock Converse returns a dict).
+            ToolCallPart('weather', {'city': 'London'}, 'tc_dict'),
+        ],
+    )
+
+    otel_parts = response.otel_message_parts(InstrumentationSettings(version=3))
+    by_id = {p['id']: p for p in otel_parts}
+
+    # The dict-shaped source is fine today.
+    assert by_id['tc_dict']['arguments'] == {'city': 'London'}, (
+        'dict args should serialise as a dict'
+    )
+
+    # The string-shaped source SHOULD also serialise as a dict, but on
+    # main it doesn't — this is the bug.
+    assert by_id['tc_string']['arguments'] == {'city': 'London'}, (
+        f"string-shaped args leaked into OTel as a string: "
+        f"{by_id['tc_string']['arguments']!r}"
+    )
