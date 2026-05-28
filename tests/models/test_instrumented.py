@@ -1929,7 +1929,7 @@ def test_message_with_native_tool_calls():
                         'id': 'tool_call_2',
                         'name': 'web_search',
                         'builtin': True,
-                        'arguments': '{"query": "weather: San Francisco, CA", "type": "search"}',
+                        'arguments': {'query': 'weather: San Francisco, CA', 'type': 'search'},
                     },
                     {
                         'type': 'tool_call_response',
@@ -2616,3 +2616,35 @@ async def test_instrumented_model_request_error(capfire: CaptureLogfire):
     # finish() was never called, so response-specific attributes are absent
     assert 'gen_ai.response.id' not in spans[0]['attributes']
     assert 'gen_ai.usage.input_tokens' not in spans[0]['attributes']
+
+
+def test_otel_message_parts_normalises_string_tool_args_to_dict():
+    """OTel tool-call `arguments` must be a dict regardless of whether
+    `ToolCallPart.args` is the dict-shaped form (non-streaming Bedrock /
+    Anthropic) or the JSON-string form (streaming Bedrock, OpenAI).
+
+    Before the normalisation, downstream OTel consumers (eg. Langfuse) saw
+    a dict for one provider/path and a string for another, breaking their
+    typed tool-call view for the string case.
+    """
+    from pydantic_ai.messages import ModelResponse, ToolCallPart
+
+    response = ModelResponse(
+        parts=[
+            # Streaming-path shape: provider streamed JSON deltas that the
+            # parts manager accumulated into a string.
+            ToolCallPart('weather', '{"city": "London"}', 'tc_string'),
+            # Non-streaming-path shape: provider returned a parsed dict.
+            ToolCallPart('weather', {'city': 'London'}, 'tc_dict'),
+            # Malformed string: not a JSON object. Falls back to passing
+            # through unchanged so we never silently mangle a value.
+            ToolCallPart('weather', 'not-json', 'tc_bad'),
+        ],
+    )
+
+    otel_parts = response.otel_message_parts(InstrumentationSettings(version=3))
+
+    by_id = {p['id']: p for p in otel_parts}
+    assert by_id['tc_string']['arguments'] == {'city': 'London'}
+    assert by_id['tc_dict']['arguments'] == {'city': 'London'}
+    assert by_id['tc_bad']['arguments'] == 'not-json'

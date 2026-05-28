@@ -2316,10 +2316,24 @@ class ModelResponse:
                     if code_arg_language := part.otel_metadata.get('code_arg_language'):
                         call_part['code_arg_language'] = code_arg_language
                 if settings.include_content and part.args is not None:
-                    if isinstance(part.args, str):
-                        call_part['arguments'] = part.args
+                    # Normalise to a dict regardless of how the provider returned args.
+                    # Non-streaming Bedrock/Anthropic return a pre-parsed dict;
+                    # streaming paths accumulate JSON deltas into a string. Without
+                    # this normalisation, OTel consumers (Langfuse, etc.) see two
+                    # different shapes for `arguments` depending on the code path,
+                    # and lose the structured tool-call view for the string shape.
+                    try:
+                        args_dict = part.args_as_dict(raise_if_invalid=True)
+                    except (ValueError, AssertionError):
+                        # Args isn't a JSON object (malformed delta accumulation,
+                        # or genuinely a non-dict shape). Fall back to today's
+                        # behaviour: pass through unchanged.
+                        if isinstance(part.args, str):
+                            call_part['arguments'] = part.args
+                        else:
+                            call_part['arguments'] = {k: serialize_any(v) for k, v in part.args.items()}
                     else:
-                        call_part['arguments'] = {k: serialize_any(v) for k, v in part.args.items()}
+                        call_part['arguments'] = {k: serialize_any(v) for k, v in args_dict.items()}
 
                 parts.append(call_part)
             elif isinstance(part, NativeToolReturnPart):
